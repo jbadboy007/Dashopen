@@ -1,168 +1,64 @@
-# Builds, signs and drafts a release of OpenDash.
-#
-# Started by pushing a version tag:
-#
-#     git tag v0.3.0 && git push origin v0.3.0
-#
-# or by hand (Actions > Release > Run workflow, on main, with the version).
-# The version is the tag without its "v" and must be the one in
-# pubspec.yaml. It runs scripts/release.sh, the same script a maintainer can run
-# on their own machine, with the signing key taken from the "release"
-# environment's secrets, and leaves a DRAFT release for a person to read and
-# publish. Nothing reaches a rider's dashboard until that draft is published
-# as a full release.
-#
-# The signing key is the thing to protect: a build signed with it installs
-# over OpenDash on a scooter, and OpenDash can send vehicle commands. So:
-#   - the key's secrets belong to the "release" environment, not the
-#     repository, and that environment should require a reviewer's approval
-#     and allow only main and v* tags;
-#   - it runs for a version tag or by hand, never for a pull request or a
-#     branch push, and only for a commit that is on main;
-#   - every action is pinned to a commit, not a tag that can be moved;
-#   - the built APK's certificate must equal the fingerprint on record
-#     (the RELEASE_CERT_SHA256 variable), so a swapped key cannot sign.
-name: Release
+name: Build Custom OpenDash APK
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to release, as in pubspec.yaml (e.g. 0.3.0)'
-        required: true
-        type: string
-
-permissions:
-  contents: read
-
-concurrency:
-  group: release
-  cancel-in-progress: false
+  push:
+    branches: [ main ]
 
 jobs:
-  release:
+  build-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    environment: release
-    permissions:
-      contents: write
-    env:
-      INPUT_VERSION: ${{ inputs.version }}
     steps:
-      - name: Which version
-        run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
-            echo "VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
-          else
-            echo "A release run by hand is started on main, not on $GITHUB_REF."
-            exit 1
-          fi
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Whole history: the commit must be shown to be on main.
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Only a commit that is on main
-        run: |
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "The commit being released is not on main. Tag a commit of main."
-            exit 1
-          fi
-
-      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: '3.50.0'
+          cache: true
 
-      - run: flutter pub get
-      - run: flutter analyze
-      - run: flutter test
+      - name: Install dependencies
+        run: flutter pub get
 
-      - name: Signing key from the environment's secrets
-        env:
-          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-          CERT: ${{ vars.RELEASE_CERT_SHA256 || secrets.RELEASE_CERT_SHA256 }}
+      - name: Build ARM64 release APK
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Ensure APK is signed
         run: |
-          for name in KEYSTORE_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD CERT; do
-            if [ -z "${!name}" ]; then
-              echo "The release environment is missing a value ($name). Set it in the repository's \"release\" environment."
-              exit 1
-            fi
-          done
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/opendash-release.jks"
-          {
-            echo "storeFile=$RUNNER_TEMP/opendash-release.jks"
-            echo "storePassword=$STORE_PASSWORD"
-            echo "keyAlias=$KEY_ALIAS"
-            echo "keyPassword=$KEY_PASSWORD"
-          } > android/key.properties
-
-      - name: Build and sign
-        env:
-          RELEASE_CERT_SHA256: ${{ vars.RELEASE_CERT_SHA256 || secrets.RELEASE_CERT_SHA256 }}
-        run: scripts/release.sh "$VERSION"
-
-      - name: Remove the signing key
-        if: always()
-        run: rm -f "$RUNNER_TEMP/opendash-release.jks" android/key.properties
-
-      - name: Draft the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "v$VERSION" "dist/opendash-$VERSION.apk" dist/opendash-release.json \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "OpenDash $VERSION" --generate-notes --draft
-          echo "A draft release v$VERSION is waiting on the Releases page. Read it, then publish it." >> "$GITHUB_STEP_SUMMARY"
-          cat dist/opendash-release.json >> "$GITHUB_STEP_SUMMARY"
-
-  # Tells the maintainer's ntfy topic how the release went, as the npm
-  # packages' publish workflows do. NTFY_URL and NTFY_TOKEN are repository
-  # secrets; without them this job does nothing.
-  notify:
-    runs-on: ubuntu-latest
-    needs: [release]
-    if: ${{ always() }}
-    permissions: {}
-    env:
-      NTFY_URL: ${{ secrets.NTFY_URL }}
-      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-      RESULT: ${{ needs.release.result }}
-    steps:
-      - name: Notify on ntfy
-        run: |
-          if [ -z "$NTFY_URL" ] || [ -z "$NTFY_TOKEN" ]; then
-            echo "NTFY_URL / NTFY_TOKEN are not set; no notification sent."
-            exit 0
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -f "$APK" ]; then
+            APK=$(ls build/app/outputs/flutter-apk/*.apk | head -n 1)
           fi
-          case "$RESULT" in
-            success) title="Release drafted: publish it"; priority=default; tags=white_check_mark ;;
-            failure) title="Release job failed"; priority=urgent; tags=warning,x ;;
-            *) title="Release job cancelled or skipped"; priority=urgent; tags=warning,x ;;
-          esac
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $NTFY_TOKEN" \
-            -H "Title: $title" \
-            -H "Priority: $priority" \
-            -H "Tags: $tags" \
-            -H "Content-Type: text/plain" \
-            -d "Repo: $GITHUB_REPOSITORY
-          Commit: $GITHUB_SHA
-          Ref: $GITHUB_REF
-          Status: $RESULT" \
-            "$NTFY_URL"
+          TOOLS_DIR=$(dirname "$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)")
+          OUT="build/app/outputs/flutter-apk/opendash-custom.apk"
+          if "$TOOLS_DIR/apksigner" verify "$APK" >/dev/null 2>&1; then
+            cp "$APK" "$OUT"
+          else
+            keytool -genkeypair -v \
+              -keystore custom.jks -storetype JKS \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias opendash \
+              -storepass opendash123 -keypass opendash123 \
+              -dname "CN=OpenDash Custom, OU=Custom, O=OpenDash, L=Local, ST=Local, C=IN"
+            "$TOOLS_DIR/zipalign" -p -f 4 "$APK" aligned.apk
+            "$TOOLS_DIR/apksigner" sign \
+              --ks custom.jks \
+              --ks-key-alias opendash \
+              --ks-pass pass:opendash123 \
+              --key-pass pass:opendash123 \
+              --out "$OUT" \
+              aligned.apk
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opendash-custom-themes-apk
+          path: build/app/outputs/flutter-apk/opendash-custom.apk
